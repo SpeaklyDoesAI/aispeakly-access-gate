@@ -2,7 +2,6 @@ import os
 import time
 import hmac
 import hashlib
-from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -11,15 +10,15 @@ from pydantic import BaseModel, Field
 app = FastAPI(title="AI Speakly Access Gate", version="1.0.0")
 
 # Required env vars:
-# - PARTNER_EMBED_SECRET
+# - PARTNER_EMBED_SECRET  (only needed if you want signed tokens ?t=...)
 # - GHL_API_KEY
 PARTNER_EMBED_SECRET = os.getenv("PARTNER_EMBED_SECRET", "")
 GHL_API_KEY = os.getenv("GHL_API_KEY", "")
 
 # Optional env vars:
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")  # set later if you want strict CORS
-
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")  # (unused for now)
+PARTNER_EMBED_KEYS_RAW = os.getenv("PARTNER_EMBED_KEYS", "")  # e.g. "ari=KEY1,reilabs=KEY2"
 
 # ---- Super-minimal in-memory rate limit (good enough to ship today) ----
 _hits: dict[str, tuple[int, int]] = {}  # key -> (window_start_epoch_minute, count)
@@ -70,10 +69,48 @@ def verify_embed_token(token: str) -> dict:
     return {"partner_id": partner_id, "user_id": user_id, "exp": exp}
 
 
+def _parse_partner_keys(raw: str) -> dict:
+    """
+    raw example: "ari=KEY1,reilabs=KEY2"
+    returns: {"ari": "KEY1", "reilabs": "KEY2"}
+    """
+    mapping: dict[str, str] = {}
+    if not raw:
+        return mapping
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    for part in parts:
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if k and v:
+            mapping[k] = v
+    return mapping
+
+
+_PARTNER_KEYS = _parse_partner_keys(PARTNER_EMBED_KEYS_RAW)
+
+
+def is_valid_partner_key(partner: str, key: str) -> bool:
+    if not partner or not key:
+        return False
+    expected = _PARTNER_KEYS.get(partner)
+    if not expected:
+        return False
+    return hmac.compare_digest(expected, key)
+
+
 class AccessCheckIn(BaseModel):
     locationId: str = Field(..., min_length=3)
     phone: str = Field(..., min_length=7, max_length=30)
-    token: str = Field(..., min_length=10)
+
+    # Support BOTH auth modes:
+    # 1) Signed token: token
+    # 2) Embed key: partner + key
+    token: str = ""
+    partner: str = ""
+    key: str = ""
 
 
 @app.get("/health")
@@ -87,13 +124,25 @@ async def access_check(payload: AccessCheckIn, request: Request):
     ip = request.client.host if request.client else "unknown"
     rate_limit(ip)
 
-    # Verify partner embed token
-    claims = verify_embed_token(payload.token)
+    # ---- AUTH: accept either signed token OR partner embed key ----
+    authed_partner_id = None
 
+    if payload.token:
+        claims = verify_embed_token(payload.token)
+        authed_partner_id = claims.get("partner_id")
+    elif payload.partner and payload.key:
+        if not _PARTNER_KEYS:
+            raise HTTPException(status_code=500, detail="PARTNER_EMBED_KEYS not configured")
+        if not is_valid_partner_key(payload.partner, payload.key):
+            raise HTTPException(status_code=401, detail="Invalid partner embed key")
+        authed_partner_id = payload.partner
+    else:
+        raise HTTPException(status_code=401, detail="Missing embed auth")
+
+    # ---- GHL call ----
     if not GHL_API_KEY:
         raise HTTPException(status_code=500, detail="GHL_API_KEY not configured")
 
-    # Server-to-server call to GHL
     url = (
         "https://services.leadconnectorhq.com/contacts/search/duplicate"
         f"?locationId={payload.locationId}&number={payload.phone}"
@@ -108,11 +157,9 @@ async def access_check(payload: AccessCheckIn, request: Request):
         resp = await client.get(url, headers=headers)
 
     if resp.status_code in (401, 403):
-        # This is on OUR side (bad token/scopes), not the user
         raise HTTPException(status_code=500, detail="GHL auth failed (token/scopes)")
 
     if resp.status_code >= 400:
-        # Don't leak details; just deny
         return {"allowLaunch": False, "exists": False, "reason": f"lookup_failed_{resp.status_code}"}
 
     data = resp.json() if resp.content else {}
@@ -122,8 +169,8 @@ async def access_check(payload: AccessCheckIn, request: Request):
     exists = bool(contact)
 
     return {
-        "allowLaunch": exists,    # minimal gating today: existence == access
+        "allowLaunch": exists,  # minimal gating today: existence == access
         "exists": exists,
         "reason": "ok" if exists else "not_found",
-        "partnerId": claims["partner_id"],
+        "partnerId": authed_partner_id,
     }
