@@ -4,10 +4,19 @@ import hmac
 import hashlib
 
 import httpx
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="AI Speakly Access Gate", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # tighten later if you want
+    allow_credentials=False,
+    allow_methods=["*"],          # includes OPTIONS + POST
+    allow_headers=["*"],
+)
 
 # Required env vars:
 # - PARTNER_EMBED_SECRET  (only needed if you want signed tokens ?t=...)
